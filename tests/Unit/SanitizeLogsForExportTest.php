@@ -108,14 +108,14 @@ it('removes GitHub tokens', function () {
         'gho_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789' => 'gho_ OAuth token',
         'ghu_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789' => 'ghu_ user-to-server token',
         'ghs_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789' => 'ghs_ server-to-server token',
+        'ghs_eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIxMjM0NTY3OCIsInN1YiI6Imluc3RhbGxhdGlvbi10b2tlbiJ9.signature-with_dots-and-hyphens' => 'ghs_ stateless server-to-server token',
         'ghr_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789' => 'ghr_ refresh token',
     ];
 
     foreach ($testCases as $token => $description) {
         $input = "Token: {$token}";
         $result = sanitizeLogsForExport($input);
-        expect($result)->not->toContain($token, "Failed to redact {$description}");
-        expect($result)->toContain(REDACTED);
+        expect($result)->toBe('Token: '.REDACTED, "Failed to redact {$description}");
     }
 });
 
@@ -151,6 +151,22 @@ it('removes AWS secret access key', function () {
 
     expect($result)->not->toContain($secretKey);
     expect($result)->toContain('aws_secret_access_key='.REDACTED);
+});
+
+it('removes HTTPS basic auth passwords from git URLs', function () {
+    $testCases = [
+        'https://oauth2:glpat-xxxxxxxxxxxx@gitlab.com/user/repo.git' => 'https://oauth2:'.REDACTED.'@'.REDACTED,
+        'https://user:my-secret-token@gitlab.example.com/group/repo.git' => 'https://user:'.REDACTED.'@'.REDACTED,
+        'http://deploy:token123@git.internal.com/repo.git' => 'http://deploy:'.REDACTED.'@'.REDACTED,
+    ];
+
+    foreach ($testCases as $input => $notExpected) {
+        $result = sanitizeLogsForExport($input);
+        // The password should be redacted
+        expect($result)->not->toContain('glpat-xxxxxxxxxxxx');
+        expect($result)->not->toContain('my-secret-token');
+        expect($result)->not->toContain('token123');
+    }
 });
 
 it('removes generic URL passwords', function () {

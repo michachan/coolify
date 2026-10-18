@@ -2,29 +2,66 @@
 
 namespace App\Jobs;
 
+use App\Models\SlackNotificationSettings;
 use App\Notifications\Dto\SlackMessage;
+use App\Rules\SafeWebhookUrl;
+use App\Traits\HandlesNotificationResponse;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Http\Client\Response;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
 
-class SendMessageToSlackJob implements ShouldQueue
+class SendMessageToSlackJob implements ShouldBeEncrypted, ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use Dispatchable, HandlesNotificationResponse, InteractsWithQueue, Queueable, SerializesModels;
+
+    /**
+     * The number of times the job may be attempted.
+     */
+    public $tries = 5;
+
+    /**
+     * The number of seconds to wait before retrying the job.
+     */
+    public $backoff = 10;
 
     public function __construct(
         private SlackMessage $message,
-        private string $webhookUrl
+        private string $webhookUrl,
+        public ?SlackNotificationSettings $settings = null,
     ) {
         $this->onQueue('high');
     }
 
     public function handle(): void
     {
-        if ($this->isSlackWebhook()) {
-            $this->sendToSlack();
+        $validator = Validator::make(
+            ['webhook_url' => $this->webhookUrl],
+            ['webhook_url' => ['required', 'url', new SafeWebhookUrl]]
+        );
+
+        if ($validator->fails()) {
+            Log::warning('SendMessageToSlackJob: blocked unsafe webhook URL', [
+                'url' => SafeWebhookUrl::redactedUrlForLog($this->webhookUrl),
+                'errors' => $validator->errors()->all(),
+            ]);
+
+            return;
+        }
+
+        try {
+            $httpOptions = SafeWebhookUrl::httpClientOptions($this->webhookUrl);
+        } catch (\RuntimeException $e) {
+            Log::warning('SendMessageToSlackJob: blocked unsafe webhook URL at send time', [
+                'url' => SafeWebhookUrl::redactedUrlForLog($this->webhookUrl),
+                'error' => $e->getMessage(),
+            ]);
 
             return;
         }
@@ -34,7 +71,12 @@ class SendMessageToSlackJob implements ShouldQueue
          *
          * @see https://github.com/coollabsio/coolify/pull/6139#issuecomment-3756777708
          */
-        $this->sendToMattermost();
+        $response = $this->isSlackWebhook()
+            ? $this->sendToSlack($httpOptions)
+            : $this->sendToMattermost($httpOptions);
+
+        // 403: posting is not allowed, 404: the webhook or channel was removed, 410: the channel is archived.
+        $this->handleNotificationResponse($response, 'Slack', in_array($response->status(), [403, 404, 410], true));
     }
 
     private function isSlackWebhook(): bool
@@ -51,9 +93,12 @@ class SendMessageToSlackJob implements ShouldQueue
         return $scheme === 'https' && $host === 'hooks.slack.com';
     }
 
-    private function sendToSlack(): void
+    /**
+     * @param  array<string, mixed>  $httpOptions
+     */
+    private function sendToSlack(array $httpOptions): Response
     {
-        Http::post($this->webhookUrl, [
+        return Http::withOptions($httpOptions)->post($this->webhookUrl, [
             'text' => $this->message->title,
             'blocks' => [
                 [
@@ -91,11 +136,14 @@ class SendMessageToSlackJob implements ShouldQueue
     /**
      * @todo v5 refactor: Extract this into a separate SendMessageToMattermostJob.php triggered via the "mattermost" notification channel type.
      */
-    private function sendToMattermost(): void
+    /**
+     * @param  array<string, mixed>  $httpOptions
+     */
+    private function sendToMattermost(array $httpOptions): Response
     {
         $username = config('app.name');
 
-        Http::post($this->webhookUrl, [
+        return Http::withOptions($httpOptions)->post($this->webhookUrl, [
             'username' => $username,
             'attachments' => [
                 [

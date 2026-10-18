@@ -4,9 +4,15 @@
 CDN="https://cdn.coollabs.io/coolify"
 LATEST_IMAGE=${1:-latest}
 LATEST_HELPER_VERSION=${2:-latest}
-REGISTRY_URL=${3:-ghcr.io}
-SKIP_BACKUP=${4:-false}
 ENV_FILE="/data/coolify/source/.env"
+if [ -n "${3+x}" ]; then
+    REGISTRY_URL="$3"
+elif [ -f "$ENV_FILE" ] && grep -q "^REGISTRY_URL=" "$ENV_FILE"; then
+    REGISTRY_URL=$(grep "^REGISTRY_URL=" "$ENV_FILE" | cut -d '=' -f2- | head -n1)
+else
+    REGISTRY_URL="docker.io"
+fi
+SKIP_BACKUP=${4:-false}
 STATUS_FILE="/data/coolify/source/.upgrade-status"
 
 DATE=$(date +%Y-%m-%d-%H-%M-%S)
@@ -30,6 +36,65 @@ write_status() {
     local step="$1"
     local message="$2"
     echo "${step}|${message}|$(date -Iseconds)" > "$STATUS_FILE"
+}
+
+# Print the first gateway of a network that Docker reports with a prefix length (fd00::1/64).
+# Docker Engine 27.0 to 28.0.0 does this for IPv6 until the daemon restarts (https://github.com/moby/moby/pull/49520).
+# The Docker CLI and Compose in the helper image fail on such a network with a ParseAddr error.
+network_gateway_with_prefix() {
+    docker network inspect "$1" --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>&1 | grep -oE '[0-9A-Fa-f:.]+/[0-9]+' | head -n1
+}
+
+# Make sure the coolify network exists and the helper image can read it.
+# It is created when starting Coolify with docker compose
+ensure_coolify_network() {
+    log "Checking Docker network 'coolify'..."
+    if ! docker network inspect coolify >/dev/null 2>&1; then
+        log "Network 'coolify' does not exist, creating..."
+        if ! docker network create --attachable --ipv6 coolify 2>/dev/null; then
+            log "Failed to create network with IPv6, trying without IPv6..."
+            docker network create --attachable coolify 2>/dev/null
+            log "Network 'coolify' created without IPv6"
+        elif [ -n "$(network_gateway_with_prefix coolify)" ]; then
+            # No container uses the new network yet, so it is safe to recreate it.
+            log "Docker reports the IPv6 gateway of network 'coolify' with a prefix length, recreating it without IPv6..."
+            docker network rm coolify >/dev/null 2>&1
+            docker network create --attachable coolify 2>/dev/null
+            log "Network 'coolify' created without IPv6"
+        else
+            log "Network 'coolify' created with IPv6 support"
+        fi
+        return 0
+    fi
+
+    log "Network 'coolify' already exists"
+    local gateway
+    gateway=$(network_gateway_with_prefix coolify)
+    if [ -n "$gateway" ]; then
+        local message="Docker Engine $(docker version --format '{{.Server.Version}}' 2>/dev/null) reports the gateway of the 'coolify' network as ${gateway}, which Coolify cannot read (Docker Engine bug, fixed in 28.0.1). Run 'systemctl restart docker' (this restarts all containers) or upgrade Docker Engine, then upgrade Coolify again."
+        log "ERROR: ${message}"
+        write_status "error" "$message"
+        echo "     ERROR: ${message}"
+        return 1
+    fi
+}
+
+# Pull an image. Retry with backoff, because the registry can rate limit many instances that pull at the same time.
+pull_image() {
+    local image="$1"
+    local attempt=1
+    local max_attempts=5
+    local delay=15
+    until docker pull "$image" >>"$LOGFILE" 2>&1; do
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            return 1
+        fi
+        log "Pull of $image failed (attempt $attempt/$max_attempts). Retrying in ${delay}s..."
+        echo "     Pull failed (attempt $attempt/$max_attempts). Retrying in ${delay}s..."
+        sleep "$((delay + RANDOM % 10))"
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
 }
 
 echo ""
@@ -56,6 +121,9 @@ log "Downloading docker-compose.prod.yml from ${CDN}/docker-compose.prod.yml"
 curl -fsSL -L $CDN/docker-compose.prod.yml -o /data/coolify/source/docker-compose.prod.yml
 log "Downloading .env.production from ${CDN}/.env.production"
 curl -fsSL -L $CDN/.env.production -o /data/coolify/source/.env.production
+log "Downloading upgrade-postgres.sh from ${CDN}/upgrade-postgres.sh"
+curl -fsSL -L $CDN/upgrade-postgres.sh -o /data/coolify/source/upgrade-postgres.sh
+chmod +x /data/coolify/source/upgrade-postgres.sh
 log "Configuration files downloaded successfully"
 echo "     Done."
 
@@ -69,9 +137,15 @@ if [ -f /data/coolify/source/docker-compose.custom.yml ]; then
     log "Including custom docker-compose.yml in image extraction"
 fi
 
+# Check if PostgreSQL upgrade override exists
+if [ -f /data/coolify/source/docker-compose.postgres-upgrade.yml ]; then
+    COMPOSE_FILES="$COMPOSE_FILES -f /data/coolify/source/docker-compose.postgres-upgrade.yml"
+    log "Including PostgreSQL upgrade compose override in image extraction"
+fi
+
 # Get all unique images from docker compose config
 # LATEST_IMAGE env var is needed for image substitution in compose files
-IMAGES=$(LATEST_IMAGE=${LATEST_IMAGE} docker compose --env-file "$ENV_FILE" $COMPOSE_FILES config --images 2>/dev/null | sort -u)
+IMAGES=$(REGISTRY_URL=${REGISTRY_URL} LATEST_IMAGE=${LATEST_IMAGE} docker compose --env-file "$ENV_FILE" $COMPOSE_FILES config --images 2>/dev/null | sort -u)
 
 if [ -z "$IMAGES" ]; then
     log "ERROR: Failed to extract images from docker-compose files"
@@ -118,27 +192,45 @@ update_env_var() {
     fi
 }
 
+set_env_var() {
+    local key="$1"
+    local value="$2"
+
+    if grep -q "^${key}=" "$ENV_FILE"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+        log "Updated ${key}"
+    else
+        printf '%s=%s\n' "$key" "$value" >>"$ENV_FILE"
+        log "Added ${key}"
+    fi
+}
+
 log "Checking environment variables..."
+set_env_var "REGISTRY_URL" "$REGISTRY_URL"
 update_env_var "PUSHER_APP_ID" "$(openssl rand -hex 32)"
 update_env_var "PUSHER_APP_KEY" "$(openssl rand -hex 32)"
 update_env_var "PUSHER_APP_SECRET" "$(openssl rand -hex 32)"
+update_env_var "PUSHER_BACKEND_PORT" "6001"
+# The realtime container no longer exists; point older installs at the bundled Reverb server
+if grep -q '^PUSHER_BACKEND_HOST=coolify-realtime$' "$ENV_FILE"; then
+    set_env_var "PUSHER_BACKEND_HOST" "127.0.0.1"
+fi
 log "Environment variables check complete"
 echo "     Done."
 
-# Make sure coolify network exists
-# It is created when starting Coolify with docker compose
-log "Checking Docker network 'coolify'..."
-if ! docker network inspect coolify >/dev/null 2>&1; then
-    log "Network 'coolify' does not exist, creating..."
-    if ! docker network create --attachable --ipv6 coolify 2>/dev/null; then
-        log "Failed to create network with IPv6, trying without IPv6..."
-        docker network create --attachable coolify 2>/dev/null
-        log "Network 'coolify' created without IPv6"
-    else
-        log "Network 'coolify' created with IPv6 support"
-    fi
-else
-    log "Network 'coolify' already exists"
+ensure_coolify_network || exit 1
+
+mkdir -p /data/coolify/images/{avatars,project-icons}
+chown -R 9999:root /data/coolify/images
+chmod -R 700 /data/coolify/images
+
+# Fix SSH directory ownership if not owned by container user UID 9999 (fixes #6621)
+# Only changes owner — preserves existing group to respect custom setups
+SSH_OWNER=$(stat -c '%u' /data/coolify/ssh 2>/dev/null || echo "unknown")
+if [ "$SSH_OWNER" != "9999" ]; then
+    log "Fixing SSH directory ownership (was owned by UID $SSH_OWNER)"
+    chown -R 9999 /data/coolify/ssh
+    chmod -R 700 /data/coolify/ssh
 fi
 
 # Check if Docker config file exists
@@ -155,10 +247,10 @@ echo "3/6 Pulling Docker images..."
 echo "     This may take a few minutes depending on your connection."
 
 # Also pull the helper image (not in compose files but needed for upgrade)
-HELPER_IMAGE="${REGISTRY_URL:-ghcr.io}/coollabsio/coolify-helper:${LATEST_HELPER_VERSION}"
+HELPER_IMAGE="${REGISTRY_URL:-docker.io}/coollabsio/coolify-helper:${LATEST_HELPER_VERSION}"
 echo "     - Pulling $HELPER_IMAGE..."
 log "Pulling image: $HELPER_IMAGE"
-if docker pull "$HELPER_IMAGE" >>"$LOGFILE" 2>&1; then
+if pull_image "$HELPER_IMAGE"; then
     log "Successfully pulled $HELPER_IMAGE"
 else
     log "ERROR: Failed to pull $HELPER_IMAGE"
@@ -173,7 +265,7 @@ for IMAGE in $IMAGES; do
     if [ -n "$IMAGE" ]; then
         echo "     - Pulling $IMAGE..."
         log "Pulling image: $IMAGE"
-        if docker pull "$IMAGE" >>"$LOGFILE" 2>&1; then
+        if pull_image "$IMAGE"; then
             log "Successfully pulled $IMAGE"
         else
             log "ERROR: Failed to pull $IMAGE"
@@ -186,6 +278,9 @@ done
 
 log "All images pulled successfully"
 echo "     All images pulled successfully."
+
+set_env_var "LATEST_IMAGE" "$LATEST_IMAGE"
+set_env_var "COOLIFY_VERSION" "$LATEST_IMAGE"
 
 log_section "Step 4/6: Stopping and restarting containers"
 write_status "4" "Stopping containers"
@@ -216,6 +311,7 @@ nohup bash -c "
     }
 
     # Stop and remove containers
+    # coolify-realtime is kept for upgrades from versions that still ran the separate realtime container
     for container in coolify coolify-db coolify-redis coolify-realtime; do
         if docker ps -a --format '{{.Names}}' | grep -q \"^\${container}\$\"; then
             log \"Stopping container: \${container}\"
@@ -236,16 +332,27 @@ nohup bash -c "
     echo '============================================================' >>\"\$LOGFILE\"
     write_status '5' 'Starting new containers'
 
+    COMPOSE_FILES='-f /data/coolify/source/docker-compose.yml -f /data/coolify/source/docker-compose.prod.yml'
     if [ -f /data/coolify/source/docker-compose.custom.yml ]; then
         log 'Using custom docker-compose.yml'
-        log 'Running docker compose up with custom configuration...'
-        docker run -v /data/coolify/source:/data/coolify/source -v /var/run/docker.sock:/var/run/docker.sock \${DOCKER_CONFIG_MOUNT} --rm \${REGISTRY_URL:-ghcr.io}/coollabsio/coolify-helper:\${LATEST_HELPER_VERSION} bash -c \"LATEST_IMAGE=\${LATEST_IMAGE} docker compose --env-file /data/coolify/source/.env -f /data/coolify/source/docker-compose.yml -f /data/coolify/source/docker-compose.prod.yml -f /data/coolify/source/docker-compose.custom.yml up -d --remove-orphans --wait --wait-timeout 60\" >>\"\$LOGFILE\" 2>&1
-    else
-        log 'Using standard docker-compose configuration'
-        log 'Running docker compose up...'
-        docker run -v /data/coolify/source:/data/coolify/source -v /var/run/docker.sock:/var/run/docker.sock \${DOCKER_CONFIG_MOUNT} --rm \${REGISTRY_URL:-ghcr.io}/coollabsio/coolify-helper:\${LATEST_HELPER_VERSION} bash -c \"LATEST_IMAGE=\${LATEST_IMAGE} docker compose --env-file /data/coolify/source/.env -f /data/coolify/source/docker-compose.yml -f /data/coolify/source/docker-compose.prod.yml up -d --remove-orphans --wait --wait-timeout 60\" >>\"\$LOGFILE\" 2>&1
+        COMPOSE_FILES=\"\$COMPOSE_FILES -f /data/coolify/source/docker-compose.custom.yml\"
     fi
-    log 'Docker compose up completed'
+    if [ -f /data/coolify/source/docker-compose.postgres-upgrade.yml ]; then
+        log 'Using PostgreSQL upgrade compose override'
+        COMPOSE_FILES=\"\$COMPOSE_FILES -f /data/coolify/source/docker-compose.postgres-upgrade.yml\"
+    fi
+
+    log 'Running docker compose up...'
+    if docker run -v /data/coolify/source:/data/coolify/source -v /var/run/docker.sock:/var/run/docker.sock \${DOCKER_CONFIG_MOUNT} --rm \${REGISTRY_URL:-docker.io}/coollabsio/coolify-helper:\${LATEST_HELPER_VERSION} bash -c \"LATEST_IMAGE=\${LATEST_IMAGE} docker compose --env-file /data/coolify/source/.env \${COMPOSE_FILES} up -d --remove-orphans --wait --wait-timeout 60\" >>\"\$LOGFILE\" 2>&1; then
+        log 'Docker compose up completed'
+    elif [ \"\$(docker inspect --format '{{.State.Running}}' coolify 2>/dev/null)\" = 'true' ]; then
+        # A slow first start (for example long migrations) can pass the wait timeout. Coolify is still starting.
+        log 'Docker compose up did not finish waiting, but the coolify container is running'
+    else
+        log 'ERROR: Docker compose up failed and the coolify container is not running'
+        write_status 'error' \"Coolify did not start. Check the upgrade log: \$LOGFILE\"
+        exit 1
+    fi
 
     # Final log entry
     echo '' >>\"\$LOGFILE\"

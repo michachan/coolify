@@ -2,6 +2,10 @@
 
 namespace App\Traits;
 
+use App\Models\Server;
+use Illuminate\Contracts\Encryption\DecryptException;
+use Illuminate\Support\Facades\Log;
+
 trait HasMetrics
 {
     public function getCpuMetrics(int $mins = 5): ?array
@@ -11,9 +15,16 @@ trait HasMetrics
 
     public function getMemoryMetrics(int $mins = 5): ?array
     {
-        $field = $this->isServerMetrics() ? 'usedPercent' : 'used';
+        if ($this->isServerMetrics()) {
+            return $this->getMetrics('memory', $mins, 'usedPercent');
+        }
 
-        return $this->getMetrics('memory', $mins, $field);
+        $metrics = $this->getMetrics('memory', $mins, 'used');
+        if ($metrics === null) {
+            return null;
+        }
+
+        return convertContainerMemoryBytesToMegabytes($metrics);
     }
 
     private function getMetrics(string $type, int $mins, string $valueField): ?array
@@ -26,8 +37,19 @@ trait HasMetrics
         $from = now()->subMinutes($mins)->toIso8601ZuluString();
         $endpoint = $this->getMetricsEndpoint($type, $from);
 
+        $previousToken = null;
+        try {
+            $previousToken = $server->settings->sentinel_token;
+        } catch (DecryptException) {
+            // fall through to ensureValidSentinelToken which will regenerate
+        }
+        $token = $server->settings->ensureValidSentinelToken();
+        if ($token !== $previousToken) {
+            Log::warning('Regenerated sentinel token during metrics read; sentinel container restart required', ['server_id' => $server->id]);
+        }
+
         $response = instant_remote_process(
-            ["docker exec coolify-sentinel sh -c 'curl -H \"Authorization: Bearer {$server->settings->sentinel_token}\" {$endpoint}'"],
+            ["docker exec coolify-sentinel sh -c 'curl -H \"Authorization: Bearer {$token}\" {$endpoint}'"],
             $server,
             false
         );
@@ -54,10 +76,10 @@ trait HasMetrics
 
     private function isServerMetrics(): bool
     {
-        return $this instanceof \App\Models\Server;
+        return $this instanceof Server;
     }
 
-    private function getMetricsServer(): \App\Models\Server
+    private function getMetricsServer(): Server
     {
         return $this->isServerMetrics() ? $this : $this->destination->server;
     }

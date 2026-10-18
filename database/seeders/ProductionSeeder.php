@@ -32,6 +32,16 @@ class ProductionSeeder extends Seeder
             echo "  Running in self-hosted mode.\n";
         }
 
+        if (Team::find(0) === null) {
+            (new Team)->forceFill([
+                'id' => 0,
+                'name' => 'Root Team',
+                'description' => 'The root team',
+                'personal_team' => true,
+                'show_boarding' => true,
+            ])->save();
+        }
+
         if (User::find(0) !== null && Team::find(0) !== null) {
             if (DB::table('team_user')->where('user_id', 0)->first() === null) {
                 DB::table('team_user')->insert([
@@ -209,6 +219,5 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->call(PopulateSshKeysDirectorySeeder::class);
         $this->call(SentinelSeeder::class);
         $this->call(RootUserSeeder::class);
-        $this->call(CaSslCertSeeder::class);
     }
 }

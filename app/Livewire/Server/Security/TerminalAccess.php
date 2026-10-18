@@ -31,7 +31,7 @@ class TerminalAccess extends Component
         }
     }
 
-    public function toggleTerminal($password)
+    public function toggleTerminal($password, $selectedActions = [])
     {
         try {
             $this->authorize('update', $this->server);
@@ -43,7 +43,7 @@ class TerminalAccess extends Component
 
             // Verify password
             if (! verifyPasswordConfirmation($password, $this)) {
-                return;
+                return 'The provided password is incorrect.';
             }
 
             // Toggle the terminal setting
@@ -54,16 +54,22 @@ class TerminalAccess extends Component
             $this->isTerminalEnabled = $this->server->settings->is_terminal_enabled;
 
             $status = $this->isTerminalEnabled ? 'enabled' : 'disabled';
+            auditLog("ui.server.terminal_access.{$status}", [
+                'team_id' => $this->server->team_id,
+                'server_uuid' => $this->server->uuid,
+                'server_name' => $this->server->name,
+            ]);
             $this->dispatch('success', "Terminal access has been {$status}.");
+
+            return true;
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }
     }
 
-    public function syncData(bool $toModel = false)
+    private function syncData(bool $toModel = false): void
     {
         if ($toModel) {
-            $this->authorize('update', $this->server);
             $this->validate();
             // No other fields to sync for terminal access
         } else {

@@ -5,12 +5,13 @@ namespace App\Jobs;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 
-class CheckTraefikVersionJob implements ShouldQueue
+class CheckTraefikVersionJob implements ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -18,6 +19,20 @@ class CheckTraefikVersionJob implements ShouldQueue
 
     public function handle(): void
     {
+        Server::query()
+            ->where(function ($query) {
+                $query->whereNull('proxy')
+                    ->orWhere('proxy->type', '!=', ProxyTypes::TRAEFIK->value);
+            })
+            ->where(function ($query) {
+                $query->whereNotNull('detected_traefik_version')
+                    ->orWhereNotNull('traefik_outdated_info');
+            })
+            ->update([
+                'detected_traefik_version' => null,
+                'traefik_outdated_info' => null,
+            ]);
+
         // Load versions from cached data
         $traefikVersions = get_traefik_versions();
 

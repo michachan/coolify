@@ -2,10 +2,13 @@
 
 namespace App\Models;
 
+use App\Traits\TracksDeliveryFailures;
 use Illuminate\Database\Eloquent\Model;
 
 class EmailNotificationSettings extends Model
 {
+    use TracksDeliveryFailures;
+
     public $timestamps = false;
 
     protected $fillable = [
@@ -21,6 +24,7 @@ class EmailNotificationSettings extends Model
         'smtp_username',
         'smtp_password',
         'smtp_timeout',
+        'smtp_ehlo_domain',
 
         'resend_enabled',
         'resend_api_key',
@@ -30,13 +34,28 @@ class EmailNotificationSettings extends Model
         'deployment_success_email_notifications',
         'deployment_failure_email_notifications',
         'status_change_email_notifications',
+        'restart_limit_reached_email_notifications',
         'backup_success_email_notifications',
         'backup_failure_email_notifications',
         'scheduled_task_success_email_notifications',
         'scheduled_task_failure_email_notifications',
+        'docker_cleanup_success_email_notifications',
+        'docker_cleanup_failure_email_notifications',
         'server_disk_usage_email_notifications',
+        'server_reachable_email_notifications',
+        'server_unreachable_email_notifications',
         'server_patch_email_notifications',
         'traefik_outdated_email_notifications',
+    ];
+
+    protected $hidden = [
+        'smtp_from_address',
+        'smtp_from_name',
+        'smtp_recipients',
+        'smtp_host',
+        'smtp_username',
+        'smtp_password',
+        'resend_api_key',
     ];
 
     protected $casts = [
@@ -58,6 +77,7 @@ class EmailNotificationSettings extends Model
         'deployment_success_email_notifications' => 'boolean',
         'deployment_failure_email_notifications' => 'boolean',
         'status_change_email_notifications' => 'boolean',
+        'restart_limit_reached_email_notifications' => 'boolean',
         'backup_success_email_notifications' => 'boolean',
         'backup_failure_email_notifications' => 'boolean',
         'scheduled_task_success_email_notifications' => 'boolean',
@@ -75,5 +95,16 @@ class EmailNotificationSettings extends Model
     public function isEnabled()
     {
         return $this->smtp_enabled || $this->resend_enabled || $this->use_instance_email_settings;
+    }
+
+    public function notificationChannelName(): string
+    {
+        return 'Email';
+    }
+
+    protected function disableNotificationChannel(): void
+    {
+        $this->smtp_enabled = false;
+        $this->resend_enabled = false;
     }
 }

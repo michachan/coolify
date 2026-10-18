@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Exceptions\RateLimitException;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Http;
 
 class HetznerService
@@ -24,7 +25,7 @@ class HetznerService
             ->timeout(30)
             ->retry(3, function (int $attempt, \Exception $exception) {
                 // Handle rate limiting (429 Too Many Requests)
-                if ($exception instanceof \Illuminate\Http\Client\RequestException) {
+                if ($exception instanceof RequestException) {
                     $response = $exception->response;
 
                     if ($response && $response->status() === 429) {
@@ -117,6 +118,16 @@ class HetznerService
         return $this->requestPaginated('get', '/ssh_keys', 'ssh_keys');
     }
 
+    public function getFirewalls(): array
+    {
+        return $this->requestPaginated('get', '/firewalls', 'firewalls');
+    }
+
+    public function getNetworks(): array
+    {
+        return $this->requestPaginated('get', '/networks', 'networks');
+    }
+
     public function uploadSshKey(string $name, string $publicKey): array
     {
         $response = $this->request('post', '/ssh_keys', [
@@ -129,18 +140,17 @@ class HetznerService
 
     public function createServer(array $params): array
     {
-        ray('Hetzner createServer request', [
-            'endpoint' => '/servers',
-            'params' => $params,
-        ]);
 
         $response = $this->request('post', '/servers', $params);
 
-        ray('Hetzner createServer response', [
-            'response' => $response,
-        ]);
-
         return $response['server'] ?? [];
+    }
+
+    public function enableServerBackup(int $serverId): array
+    {
+        $response = $this->request('post', "/servers/{$serverId}/actions/enable_backup");
+
+        return $response['action'] ?? [];
     }
 
     public function getServer(int $serverId): array
@@ -169,18 +179,19 @@ class HetznerService
 
     public function findServerByIp(string $ip): ?array
     {
+        $ip = normalizeIpAddress($ip);
+        $isIpv6 = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
         $servers = $this->getServers();
 
         foreach ($servers as $server) {
-            // Check IPv4
             $ipv4 = data_get($server, 'public_net.ipv4.ip');
-            if ($ipv4 === $ip) {
+            if (filled($ipv4) && normalizeIpAddress($ipv4) === $ip) {
                 return $server;
             }
 
-            // Check IPv6 (Hetzner returns the full /64 block)
-            $ipv6 = data_get($server, 'public_net.ipv6.ip');
-            if ($ipv6 && str_starts_with($ip, rtrim($ipv6, '/'))) {
+            // Hetzner returns the IPv6 network (2a01:4f8:c016:bd23::/64), not the server address.
+            $ipv6Network = data_get($server, 'public_net.ipv6.ip');
+            if ($isIpv6 && filled($ipv6Network) && str_contains($ipv6Network, '/') && ipMatch($ip, [$ipv6Network])) {
                 return $server;
             }
         }

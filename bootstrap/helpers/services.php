@@ -1,6 +1,32 @@
 <?php
 
+function service_logo_urls(mixed $logo): array
+{
+    $defaultLogo = 'svgs/default.webp';
+
+    if (! is_string($logo) || $logo === '' || basename($logo) === basename($defaultLogo)) {
+        return [
+            'logo' => asset($defaultLogo),
+            'logo_cdn_url' => asset($defaultLogo),
+            'logo_default_url' => asset($defaultLogo),
+        ];
+    }
+
+    if (str_starts_with($logo, 'svg/')) {
+        $logo = 'svgs/'.str($logo)->after('svg/');
+    }
+
+    $logo = ltrim($logo, '/');
+
+    return [
+        'logo' => asset($logo),
+        'logo_cdn_url' => 'https://raw.githubusercontent.com/coollabsio/coolify/refs/heads/main/public/'.$logo,
+        'logo_default_url' => asset($defaultLogo),
+    ];
+}
+
 use App\Models\Application;
+use App\Models\LocalFileVolume;
 use App\Models\Service;
 use App\Models\ServiceApplication;
 use App\Models\ServiceDatabase;
@@ -17,15 +43,154 @@ function collectRegex(string $name)
 {
     return "/{$name}\w+/";
 }
+
+/**
+ * Extract content between balanced braces, handling nested braces properly.
+ *
+ * @param  string  $str  The string to search
+ * @param  int  $startPos  Position to start searching from
+ * @return array|null Array with 'content', 'start', and 'end' keys, or null if no balanced braces found
+ */
+function extractBalancedBraceContent(string $str, int $startPos = 0): ?array
+{
+    // Find opening brace
+    if ($startPos >= strlen($str)) {
+        return null;
+    }
+    $openPos = strpos($str, '{', $startPos);
+    if ($openPos === false) {
+        return null;
+    }
+
+    // Track depth to find matching closing brace
+    $depth = 1;
+    $pos = $openPos + 1;
+    $len = strlen($str);
+
+    while ($pos < $len && $depth > 0) {
+        if ($str[$pos] === '{') {
+            $depth++;
+        } elseif ($str[$pos] === '}') {
+            $depth--;
+        }
+        $pos++;
+    }
+
+    if ($depth !== 0) {
+        // Unbalanced braces
+        return null;
+    }
+
+    return [
+        'content' => substr($str, $openPos + 1, $pos - $openPos - 2),
+        'start' => $openPos,
+        'end' => $pos - 1,
+    ];
+}
+
+/**
+ * Split variable expression on operators (:-,  -,  :?,  ?) while respecting nested braces.
+ *
+ * @param  string  $content  The content to split (without outer ${...})
+ * @return array|null Array with 'variable', 'operator', and 'default' keys, or null if no operator found
+ */
+function splitOnOperatorOutsideNested(string $content): ?array
+{
+    $operators = [':-', '-', ':?', '?'];
+    $depth = 0;
+    $len = strlen($content);
+
+    for ($i = 0; $i < $len; $i++) {
+        if ($content[$i] === '{') {
+            $depth++;
+        } elseif ($content[$i] === '}') {
+            $depth--;
+        } elseif ($depth === 0) {
+            // Check for operators only at depth 0 (outside nested braces)
+            foreach ($operators as $op) {
+                if (substr($content, $i, strlen($op)) === $op) {
+                    return [
+                        'variable' => substr($content, 0, $i),
+                        'operator' => $op,
+                        'default' => substr($content, $i + strlen($op)),
+                    ];
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
 function replaceVariables(string $variable): Stringable
 {
-    return str($variable)->before('}')->replaceFirst('$', '')->replaceFirst('{', '');
+    // Handle ${VAR} syntax with proper brace matching
+    $str = str($variable);
+
+    // Handle ${VAR} format
+    if ($str->startsWith('${')) {
+        $result = extractBalancedBraceContent($variable, 0);
+        if ($result !== null) {
+            return str($result['content']);
+        }
+
+        // Fallback to old behavior for malformed input
+        return $str->before('}')->replaceFirst('$', '')->replaceFirst('{', '');
+    }
+
+    // Handle {VAR} format (from regex capture group without $)
+    if ($str->startsWith('{') && $str->endsWith('}')) {
+        return str(substr($variable, 1, -1));
+    }
+
+    // Handle {VAR format (from regex capture group, may be truncated)
+    if ($str->startsWith('{')) {
+        $result = extractBalancedBraceContent('$'.$variable, 0);
+        if ($result !== null) {
+            return str($result['content']);
+        }
+
+        // Fallback: remove { and get content before }
+        return $str->replaceFirst('{', '')->before('}');
+    }
+
+    // Handle bare $VAR format (no braces)
+    if ($str->startsWith('$')) {
+        return $str->replaceFirst('$', '');
+    }
+
+    return $str;
+}
+
+/**
+ * Quote a storage path without changing its existing simple shell-variable expansion.
+ */
+function filesystemVolumeShellArgument(string $path): string
+{
+    if (trim($path) === '') {
+        throw new Exception('Invalid storage path: path is empty.');
+    }
+    validateComposeArrayVolumeSource($path);
+
+    $tilde = '';
+    if (preg_match('/^~[A-Za-z0-9_-]*(?:\/|$)/', $path, $matches)) {
+        $tilde = $matches[0];
+        $path = substr($path, strlen($tilde));
+    }
+
+    if (! str_contains($path, '$')) {
+        return $tilde === '' ? escapeshellarg($path) : $tilde.($path === '' ? '' : escapeshellarg($path));
+    }
+
+    $quotedPath = str_replace(['\\', '"'], ['\\\\', '\\"'], $path);
+
+    return $tilde.'"'.$quotedPath.'"';
 }
 
 function getFilesystemVolumesFromServer(ServiceApplication|ServiceDatabase|Application $oneService, bool $isInit = false)
 {
     try {
-        if ($oneService->getMorphClass() === \App\Models\Application::class) {
+        if ($oneService->getMorphClass() === Application::class) {
             $workdir = $oneService->workdir();
             $server = $oneService->destination->server;
         } else {
@@ -33,33 +198,36 @@ function getFilesystemVolumesFromServer(ServiceApplication|ServiceDatabase|Appli
             $server = $oneService->service->server;
         }
         $fileVolumes = $oneService->fileStorages()->get();
+        $escapedWorkdir = escapeshellarg($workdir);
         $commands = collect([
-            "mkdir -p $workdir > /dev/null 2>&1 || true",
-            "cd $workdir",
+            "mkdir -p -- {$escapedWorkdir} > /dev/null 2>&1 || true",
         ]);
         instant_remote_process($commands, $server);
         foreach ($fileVolumes as $fileVolume) {
-            $path = str(data_get($fileVolume, 'fs_path'));
             $content = data_get($fileVolume, 'content');
-            if ($path->startsWith('.')) {
-                $path = $path->after('.');
-                $fileLocation = $workdir.$path;
-            } else {
-                $fileLocation = $path;
-            }
+            // A relative path is inside the resource directory, never in the SSH user's working
+            // directory. A persisted Compose expression (`${VAR:-/path}`) stays as it is.
+            $fsPath = trim((string) $fileVolume->fs_path);
+            $fileLocation = str_starts_with($fsPath, '$') ? $fsPath : $fileVolume->resolvedFsPath($workdir)->value();
+            $escapedFileLocation = filesystemVolumeShellArgument((string) $fileLocation);
             // Exists and is a file
-            $isFile = instant_remote_process(["test -f $fileLocation && echo OK || echo NOK"], $server);
+            $isFile = instant_remote_process(["test -f {$escapedFileLocation} && echo OK || echo NOK"], $server);
             // Exists and is a directory
-            $isDir = instant_remote_process(["test -d $fileLocation && echo OK || echo NOK"], $server);
+            $isDir = instant_remote_process(["test -d {$escapedFileLocation} && echo OK || echo NOK"], $server);
 
             if ($isFile === 'OK') {
-                // If its a file & exists
-                $filesystemContent = instant_remote_process(["cat $fileLocation"], $server);
-                if ($fileVolume->is_based_on_git) {
-                    $fileVolume->content = $filesystemContent;
-                }
                 $fileVolume->is_directory = false;
                 $fileVolume->save();
+                if ($fileVolume->is_based_on_git) {
+                    $fileVolume->loadStorageOnServer();
+                }
+            } elseif ($isDir === 'OK' && ! $fileVolume->is_directory && filled($content)) {
+                // A configured file must not lose its content because a directory is at its path.
+                // Docker leaves an empty directory when it starts before the file exists: replace it.
+                // A directory with files stays; the start or deployment shows a warning for it.
+                if (LocalFileVolume::remoteFileStates([(string) $fileLocation], $server)[0] === 'empty-directory') {
+                    $fileVolume->saveStorageOnServer();
+                }
             } elseif ($isDir === 'OK') {
                 // If its a directory & exists
                 $fileVolume->content = null;
@@ -71,26 +239,25 @@ function getFilesystemVolumesFromServer(ServiceApplication|ServiceDatabase|Appli
                 $fileVolume->is_directory = false;
                 $fileVolume->save();
                 $content = base64_encode($content);
-                $dir = str($fileLocation)->dirname();
                 instant_remote_process([
-                    "mkdir -p $dir",
-                    "echo '$content' | base64 -d | tee $fileLocation",
+                    'mkdir -p -- "$(dirname -- '.$escapedFileLocation.')"',
+                    "echo '$content' | base64 -d | tee -- {$escapedFileLocation}",
                 ], $server);
             } elseif ($isFile === 'NOK' && $isDir === 'NOK' && $fileVolume->is_directory && $isInit) {
                 // Does not exists (no dir or file), flagged as directory, is init
                 $fileVolume->content = null;
                 $fileVolume->is_directory = true;
                 $fileVolume->save();
-                instant_remote_process(["mkdir -p $fileLocation"], $server);
+                instant_remote_process(["mkdir -p -- {$escapedFileLocation}"], $server);
             } elseif ($isFile === 'NOK' && $isDir === 'NOK' && ! $fileVolume->is_directory && $isInit && is_null($content)) {
                 // Does not exists (no dir or file), not flagged as directory, is init, has no content => create directory
                 $fileVolume->content = null;
                 $fileVolume->is_directory = true;
                 $fileVolume->save();
-                instant_remote_process(["mkdir -p $fileLocation"], $server);
+                instant_remote_process(["mkdir -p -- {$escapedFileLocation}"], $server);
             }
         }
-    } catch (\Throwable $e) {
+    } catch (Throwable $e) {
         return handleError($e);
     }
 }
@@ -100,9 +267,9 @@ function updateCompose(ServiceApplication|ServiceDatabase $resource)
         $name = data_get($resource, 'name');
         $dockerComposeRaw = data_get($resource, 'service.docker_compose_raw');
         if (! $dockerComposeRaw) {
-            throw new \Exception('No compose file found or not a valid YAML file.');
+            throw new Exception('No compose file found or not a valid YAML file.');
         }
-        $dockerCompose = Yaml::parse($dockerComposeRaw);
+        $dockerCompose = parseDockerComposeYaml($dockerComposeRaw);
 
         // Switch Image
         $updatedImage = data_get_str($resource, 'image');
@@ -121,7 +288,7 @@ function updateCompose(ServiceApplication|ServiceDatabase $resource)
         // IMPORTANT: Only extract variables that are DIRECTLY DECLARED for this service,
         // not variables that are merely referenced from other services
         $serviceConfig = data_get($dockerCompose, "services.{$name}");
-        $environment = data_get($serviceConfig, 'environment', []);
+        $environment = data_get($serviceConfig, 'environment') ?? [];
         $templateVariableNames = [];
 
         foreach ($environment as $key => $value) {
@@ -146,8 +313,16 @@ function updateCompose(ServiceApplication|ServiceDatabase $resource)
             // Those belong to other services and will be updated when THOSE services are updated
         }
 
-        // Remove duplicates
-        $templateVariableNames = array_unique($templateVariableNames);
+        // Remove duplicates and copies of another application's declaration
+        $templateVariableNames = array_filter(
+            array_unique($templateVariableNames),
+            fn ($variableName) => ! isCopiedServiceUrlDeclaration(
+                $resource->service,
+                collect(data_get($dockerCompose, 'services', [])),
+                $resource,
+                $variableName,
+            ),
+        );
 
         // Extract unique service names to process (preserving the original case from template)
         // This allows us to create both URL and FQDN pairs regardless of which one is in the template
@@ -211,22 +386,13 @@ function updateCompose(ServiceApplication|ServiceDatabase $resource)
         }
 
         if ($resource->fqdn) {
-            $resourceFqdns = str($resource->fqdn)->explode(',');
-            $resourceFqdns = $resourceFqdns->first();
-            $url = Url::fromString($resourceFqdns);
+            $firstFqdn = firstDomainFromList($resource->fqdn);
+            $url = Url::fromString($firstFqdn);
             $port = $url->getPort();
-            $path = $url->getPath();
 
-            // Prepare URL value (with scheme and host)
-            $urlValue = $url->getScheme().'://'.$url->getHost();
-            $urlValue = ($path === '/') ? $urlValue : $urlValue.$path;
-
-            // Prepare FQDN value (host only, no scheme)
-            $fqdnHost = $url->getHost();
-            $fqdnValue = str($fqdnHost)->after('://');
-            if ($path !== '/') {
-                $fqdnValue = $fqdnValue.$path;
-            }
+            // Same helpers as application/service parsers (COOLIFY_URL / COOLIFY_FQDN).
+            $urlValue = getFqdnWithoutPort($firstFqdn);
+            $fqdnValue = getHostWithoutPort($firstFqdn);
 
             // For each service name found in template, create BOTH SERVICE_URL and SERVICE_FQDN pairs
             foreach ($serviceNamesToProcess as $serviceInfo) {
@@ -282,7 +448,7 @@ function updateCompose(ServiceApplication|ServiceDatabase $resource)
                 }
             }
         }
-    } catch (\Throwable $e) {
+    } catch (Throwable $e) {
         return handleError($e);
     }
 }
@@ -381,7 +547,7 @@ function applyServiceApplicationPrerequisites(Service $service): void
                 }
             }
         }
-    } catch (\Throwable $e) {
+    } catch (Throwable $e) {
         // Log error but don't throw - prerequisites are nice-to-have, not critical
         Log::error('Failed to apply service application prerequisites', [
             'service_id' => $service->id,
